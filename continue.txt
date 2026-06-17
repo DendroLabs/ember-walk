@@ -1,45 +1,55 @@
 ## Context
-Emberwalk is a lightweight web research tool (CLI + MCP) that replaces Firecrawl for simple research workflows. It searches, fetches pages with anti-bot defaults, extracts clean markdown, and outputs a directory of .md files. Built in a single session on 2026-06-17.
+Emberwalk is a lightweight web research tool (CLI + MCP) that replaces Firecrawl for typical research workflows. It searches, fetches pages with anti-bot defaults and a 3-tier extraction pipeline, and outputs clean markdown. The MCP server exposes three tools for a two-step workflow where the LLM picks which pages to fetch.
 
 ## Current State
-The tool is fully functional and tested:
-- emberwalk.py — single-file script (~250 lines), CLI + MCP server
-- requirements.txt — ddgs, requests, trafilatura, html2text, playwright, playwright-stealth, mcp
-- .venv/ — virtual environment with all deps installed, Playwright chromium browser installed
-- README.md — complete usage docs
-- CLAUDE.md — project conventions
-- .gitignore — excludes .venv, __pycache__, research_output
-- MCP config — registered in ~/.claude/.mcp.json as "emberwalk"
-- Permission — mcp__emberwalk__* in ~/.claude/settings.json
-- Git repo initialized, all files staged but NOT yet committed
+Fully built, tested, and pushed to DendroLabs/ember-walk (3 commits on main).
 
-CLI test passed: "best note taking apps 2026" with --results 5 fetched 5/5 pages successfully with clean markdown output.
-MCP server handshake verified (responds correctly to JSON-RPC initialize).
+Key files:
+- emberwalk.py — single-file script, CLI + MCP server (~450 lines)
+- install.sh — one-command setup (venv + deps + Playwright chromium)
+- benchmark.py — Emberwalk vs Firecrawl comparison on Cisco docs
+- requirements.txt — ddgs, requests, trafilatura, beautifulsoup4, lxml, html2text, playwright, playwright-stealth, mcp
+
+MCP config:
+- ~/.claude/.mcp.json — "emberwalk" server entry pointing to .venv/bin/python3
+- ~/.claude/settings.json — mcp__emberwalk__* permission
+
+Three MCP tools:
+- ew_search(query, max_results=20, use_brave=False) — returns JSON snippets, no fetching
+- ew_fetch(urls, output_dir="") — fetches specific URLs to markdown files on disk
+- ew_research(query, max_results=10) — combined search+fetch (convenience)
+
+Benchmark results (11 Cisco IOS-XR doc pages):
+- Emberwalk: 65.7s, 1.35M chars, 11/11 pages
+- Firecrawl: 406.1s, 862K chars, 5/11 pages (rest timed out)
 
 ## Remaining Work
-1. Create initial git commit
-2. Add remote and push to GitHub (user is setting up the repo — check if DendroLabs/emberwalk exists)
-3. Test MCP tool live from a Claude Code session (requires Claude Code restart to load the new server)
-4. Optional: add progress output in MCP mode (currently silent during multi-page fetch)
-5. Optional: add --json flag for structured output
-6. Optional: add page caching to avoid re-fetching same URLs
+1. Test MCP tools live from a Claude Code session (requires restart to load server)
+2. Test install.sh on work machine (clone + run)
+3. Consider: page caching to avoid re-fetching same URLs
+4. Consider: progress output in MCP mode (currently silent during fetch)
+5. Consider: --urls CLI flag for direct URL fetching without search
 
 ## Key Decisions Already Made
 - Name: "emberwalk" (riff on Firecrawl — ember = lighter fire, walk = lighter than crawl)
-- Single file, not a package — emberwalk.py does everything
-- DuckDuckGo default, Brave Search optional via BRAVE_API_KEY env var
-- Tiered fetch: simple HTTP first, Playwright only when content < 200 chars
-- Output: directory of .md files + index.md (not a single combined file)
-- MCP server uses FastMCP + stdio, same pattern as PIF
-- Project lives at ~/Documents/emberwalk/ (not in misc/)
+- Single file, not a package
+- Two-step MCP workflow: ew_search (snippets) -> LLM picks -> ew_fetch (pages)
+- ew_research kept as one-shot convenience tool
+- 3-tier extraction: trafilatura -> BeautifulSoup largest container -> full page stripped
+- Container extraction picks LARGEST matching selector, not first match
+- Project at ~/Documents/emberwalk/ (not misc/)
+- Repo: DendroLabs/ember-walk
 
 ## Pitfalls to Avoid
-- The search package is `ddgs`, NOT `duckduckgo-search` — the old name is deprecated and silently returns 0 results
-- pip on macOS requires a venv — system pip refuses to install (PEP 668)
-- MCP config must use the venv's python3 path, not system python
+- `ddgs` package, NOT `duckduckgo-search` — old name silently returns 0 results
+- playwright-stealth v2.x: `Stealth().apply_stealth_sync(page)`, NOT `stealth_sync(page)`
+- Moving a venv breaks it (hardcoded shebangs) — recreate at new path
+- Trafilatura truncates long technical docs — the 3-tier pipeline handles this
+- Container extraction: `<article>` often matches first subsection (~5K chars) while `[role="main"]` matches the full page (~400K chars) — always pick the largest
 
 ## Verification
-1. CLI: source .venv/bin/activate && python3 emberwalk.py "test query" --results 3
-   Expected: 3 .md files + index.md in research_output/test-query/
-2. MCP: echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}' | .venv/bin/python3 emberwalk.py --serve 2>/dev/null
-   Expected: JSON response with serverInfo.name = "emberwalk"
+1. MCP server: cd ~/Documents/emberwalk && echo '{"jsonrpc":"2.0","id":1,"method":"initialize",...}' | .venv/bin/python3 emberwalk.py --serve
+   Expected: serverInfo.name = "emberwalk", 3 tools listed
+2. CLI: .venv/bin/python3 emberwalk.py "test query" --results 3
+   Expected: research_output/test-query/ with 3 .md files + index.md
+3. Install on new machine: git clone https://github.com/DendroLabs/ember-walk.git && cd ember-walk && ./install.sh
