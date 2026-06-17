@@ -112,15 +112,24 @@ def make_session():
     return session
 
 
-def fetch_simple(url, session):
+def fetch_simple(url, session, retries=1):
     session.headers["User-Agent"] = random.choice(USER_AGENTS)
-    try:
-        resp = session.get(url, timeout=15, allow_redirects=True)
-        resp.raise_for_status()
-        return resp.text
-    except requests.RequestException as e:
-        print(f"  Simple fetch failed for {url}: {e}", file=sys.stderr)
-        return None
+    for attempt in range(1 + retries):
+        try:
+            resp = session.get(url, timeout=15, allow_redirects=True)
+            resp.raise_for_status()
+            return resp.text
+        except (requests.ConnectionError, requests.Timeout) as e:
+            if attempt < retries:
+                wait = 1.0 + random.random()
+                print(f"  Retrying {url} in {wait:.1f}s ({e})", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            print(f"  Simple fetch failed for {url}: {e}", file=sys.stderr)
+            return None
+        except requests.RequestException as e:
+            print(f"  Simple fetch failed for {url}: {e}", file=sys.stderr)
+            return None
 
 
 def fetch_playwright(url, browser=None):
@@ -284,37 +293,77 @@ def _extract_full_page(html):
     return h.handle(str(soup))
 
 
+def _count_headings(html):
+    """Count h2/h3 headings as a proxy for structural density."""
+    soup = BeautifulSoup(html, "lxml")
+    return len(soup.find_all(["h2", "h3"]))
+
+
 def clean_html(html, url):
     if not html:
-        return None
+        return None, None
 
     error = _detect_error_page(html)
     if error:
         print(f"  Detected error page ({error}), skipping", file=sys.stderr)
-        return None
+        return None, None
 
     visible_len = _visible_text_len(html)
+    heading_count = _count_headings(html)
 
-    # Tier 1: trafilatura — best for articles/blogs, fast and clean
-    text = trafilatura.extract(html, output_format="txt", include_links=True, include_tables=True)
-    if text and len(text.strip()) >= 100:
-        # Check if trafilatura captured most of the page content
-        ratio = len(text.strip()) / max(visible_len, 1)
-        if ratio > 0.15:
-            return text
-        print(f"  Trafilatura captured only {ratio:.0%} of page, trying container extraction", file=sys.stderr)
+    # Compute all tiers, then choose the best
+    traf_text = trafilatura.extract(html, output_format="txt", include_links=True, include_tables=True)
+    traf_len = len(traf_text.strip()) if traf_text else 0
+    traf_ratio = traf_len / max(visible_len, 1)
 
-    # Tier 2: targeted container — find <main>/<article>/etc and convert
     container_text = _extract_main_container(html)
-    if container_text and len(container_text.strip()) >= 200:
-        return container_text
+    container_len = len(container_text.strip()) if container_text else 0
 
-    # Tier 3: full page with boilerplate stripped
     full_text = _extract_full_page(html)
-    if full_text and len(full_text.strip()) >= 100:
-        return full_text
+    full_len = len(full_text.strip()) if full_text else 0
 
-    return None
+    chosen = None
+    tier_used = None
+    warning = None
+
+    # For structurally dense pages (many headings), prefer container over trafilatura
+    # since trafilatura is an article extractor that often truncates reference docs
+    traf_ok = traf_text and traf_len >= 100 and traf_ratio > 0.15
+    container_ok = container_text and container_len >= 200
+
+    if traf_ok and container_ok:
+        # Both viable — pick the more complete one
+        # If container is substantially larger, it likely captured content trafilatura missed
+        if container_len > traf_len * 1.5 or (heading_count >= 10 and container_len > traf_len):
+            chosen, tier_used = container_text, "container"
+            print(f"  Tier 2 (container) chosen over Tier 1: {container_len} vs {traf_len} chars, {heading_count} headings", file=sys.stderr)
+        else:
+            chosen, tier_used = traf_text, "trafilatura"
+    elif traf_ok:
+        chosen, tier_used = traf_text, "trafilatura"
+    elif container_ok:
+        chosen, tier_used = container_text, "container"
+        if traf_text:
+            print(f"  Trafilatura captured only {traf_ratio:.0%} of page, using container extraction", file=sys.stderr)
+    elif full_text and full_len >= 100:
+        chosen, tier_used = full_text, "full_page"
+    else:
+        return None, None
+
+    # Completeness check: warn if chosen output is suspiciously thin
+    chosen_len = len(chosen.strip())
+    chosen_ratio = chosen_len / max(visible_len, 1)
+    if chosen_ratio < 0.10 and visible_len > 1000:
+        warning = f"possible truncation ({chosen_ratio:.0%} of visible text, tier={tier_used})"
+        print(f"  WARNING: {warning}", file=sys.stderr)
+    elif heading_count >= 5:
+        # Count headings surviving in output as a structural check
+        output_headings = len(re.findall(r'^#{1,3}\s', chosen, re.MULTILINE))
+        if output_headings < heading_count * 0.3:
+            warning = f"possible truncation ({output_headings}/{heading_count} headings preserved, tier={tier_used})"
+            print(f"  WARNING: {warning}", file=sys.stderr)
+
+    return chosen, warning
 
 
 # -- Output ------------------------------------------------------------------
@@ -330,17 +379,20 @@ def write_output(query, results, contents, output_dir):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    ok_count = len([c for c, _ in contents if c])
+    warn_count = len([w for _, w in contents if w])
     index_lines = [
         f"# Research: {query}",
         f"Date: {now}",
-        f"Results: {len([c for c in contents if c])}/{len(results)} pages fetched successfully",
+        f"Results: {ok_count}/{len(results)} pages fetched successfully"
+        + (f" ({warn_count} with warnings)" if warn_count else ""),
         "",
         "---",
         "",
     ]
 
     file_count = 0
-    for i, (result, content) in enumerate(zip(results, contents)):
+    for i, (result, (content, warning)) in enumerate(zip(results, contents)):
         if not content:
             index_lines.append(f"- **{result['title']}** — FAILED TO FETCH")
             index_lines.append(f"  {result['url']}")
@@ -362,7 +414,8 @@ def write_output(query, results, contents, output_dir):
         ])
         (output_dir / filename).write_text(page_md, encoding="utf-8")
 
-        index_lines.append(f"- **[{result['title']}]({filename})**")
+        warn_flag = f" -- WARNING: {warning}" if warning else ""
+        index_lines.append(f"- **[{result['title']}]({filename})**{warn_flag}")
         index_lines.append(f"  {result['snippet']}")
         index_lines.append("")
 
@@ -386,10 +439,11 @@ def run_cli(args):
     for i, r in enumerate(results):
         print(f"[{i+1}/{len(results)}] Fetching: {r['title'][:60]}")
         html = fetch_page(r["url"], session, delay=args.delay)
-        content = clean_html(html, r["url"])
-        contents.append(content)
+        content, warning = clean_html(html, r["url"])
+        contents.append((content, warning))
         if content:
-            print(f"  OK ({len(content)} chars)")
+            warn_msg = f" [WARNING: {warning}]" if warning else ""
+            print(f"  OK ({len(content)} chars){warn_msg}")
         else:
             print("  FAILED — no usable content")
 
@@ -405,17 +459,20 @@ def _write_fetch_output(urls_and_titles, contents, output_dir):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    ok_count = len([c for c, _ in contents if c])
+    warn_count = len([w for _, w in contents if w])
     index_lines = [
         f"# Fetched Pages",
         f"Date: {now}",
-        f"Results: {len([c for c in contents if c])}/{len(urls_and_titles)} pages fetched successfully",
+        f"Results: {ok_count}/{len(urls_and_titles)} pages fetched successfully"
+        + (f" ({warn_count} with warnings)" if warn_count else ""),
         "",
         "---",
         "",
     ]
 
     file_count = 0
-    for (url, title), content in zip(urls_and_titles, contents):
+    for (url, title), (content, warning) in zip(urls_and_titles, contents):
         if not content:
             index_lines.append(f"- **{title or url}** — FAILED TO FETCH")
             index_lines.append(f"  {url}")
@@ -437,7 +494,8 @@ def _write_fetch_output(urls_and_titles, contents, output_dir):
         ])
         (output_dir / filename).write_text(page_md, encoding="utf-8")
 
-        index_lines.append(f"- **[{title or url}]({filename})**")
+        warn_flag = f" -- WARNING: {warning}" if warning else ""
+        index_lines.append(f"- **[{title or url}]({filename})**{warn_flag}")
         index_lines.append(f"  {url}")
         index_lines.append("")
 
@@ -505,7 +563,7 @@ def run_mcp_server():
         for i, url in enumerate(urls):
             print(f"[{i+1}/{len(urls)}] Fetching: {url[:80]}")
             html = fetch_page(url, session, delay=1.5)
-            content = clean_html(html, url)
+            content, warning = clean_html(html, url)
             title = ""
             if html:
                 soup = BeautifulSoup(html, "lxml")
@@ -513,7 +571,7 @@ def run_mcp_server():
                 if title_tag:
                     title = title_tag.get_text(strip=True)
             urls_and_titles.append((url, title))
-            contents.append(content)
+            contents.append((content, warning))
 
         if not output_dir:
             ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -545,8 +603,8 @@ def run_mcp_server():
         contents = []
         for i, r in enumerate(results):
             html = fetch_page(r["url"], session, delay=1.5)
-            content = clean_html(html, r["url"])
-            contents.append(content)
+            content, warning = clean_html(html, r["url"])
+            contents.append((content, warning))
 
         if not output_dir:
             output_dir = str(Path("research_output") / slugify(query))
