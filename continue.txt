@@ -1,0 +1,45 @@
+## Context
+Emberwalk is a lightweight web research tool (CLI + MCP) that replaces Firecrawl for simple research workflows. It searches, fetches pages with anti-bot defaults, extracts clean markdown, and outputs a directory of .md files. Built in a single session on 2026-06-17.
+
+## Current State
+The tool is fully functional and tested:
+- emberwalk.py — single-file script (~250 lines), CLI + MCP server
+- requirements.txt — ddgs, requests, trafilatura, html2text, playwright, playwright-stealth, mcp
+- .venv/ — virtual environment with all deps installed, Playwright chromium browser installed
+- README.md — complete usage docs
+- CLAUDE.md — project conventions
+- .gitignore — excludes .venv, __pycache__, research_output
+- MCP config — registered in ~/.claude/.mcp.json as "emberwalk"
+- Permission — mcp__emberwalk__* in ~/.claude/settings.json
+- Git repo initialized, all files staged but NOT yet committed
+
+CLI test passed: "best note taking apps 2026" with --results 5 fetched 5/5 pages successfully with clean markdown output.
+MCP server handshake verified (responds correctly to JSON-RPC initialize).
+
+## Remaining Work
+1. Create initial git commit
+2. Add remote and push to GitHub (user is setting up the repo — check if DendroLabs/emberwalk exists)
+3. Test MCP tool live from a Claude Code session (requires Claude Code restart to load the new server)
+4. Optional: add progress output in MCP mode (currently silent during multi-page fetch)
+5. Optional: add --json flag for structured output
+6. Optional: add page caching to avoid re-fetching same URLs
+
+## Key Decisions Already Made
+- Name: "emberwalk" (riff on Firecrawl — ember = lighter fire, walk = lighter than crawl)
+- Single file, not a package — emberwalk.py does everything
+- DuckDuckGo default, Brave Search optional via BRAVE_API_KEY env var
+- Tiered fetch: simple HTTP first, Playwright only when content < 200 chars
+- Output: directory of .md files + index.md (not a single combined file)
+- MCP server uses FastMCP + stdio, same pattern as PIF
+- Project lives at ~/Documents/emberwalk/ (not in misc/)
+
+## Pitfalls to Avoid
+- The search package is `ddgs`, NOT `duckduckgo-search` — the old name is deprecated and silently returns 0 results
+- pip on macOS requires a venv — system pip refuses to install (PEP 668)
+- MCP config must use the venv's python3 path, not system python
+
+## Verification
+1. CLI: source .venv/bin/activate && python3 emberwalk.py "test query" --results 3
+   Expected: 3 .md files + index.md in research_output/test-query/
+2. MCP: echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}' | .venv/bin/python3 emberwalk.py --serve 2>/dev/null
+   Expected: JSON response with serverInfo.name = "emberwalk"
