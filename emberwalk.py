@@ -13,6 +13,7 @@ from pathlib import Path
 import requests
 import trafilatura
 import html2text
+from bs4 import BeautifulSoup
 from ddgs import DDGS
 
 USER_AGENTS = [
@@ -35,6 +36,36 @@ DEFAULT_HEADERS = {
 }
 
 PLAYWRIGHT_MIN_CONTENT_LEN = 200
+
+MAIN_CONTENT_SELECTORS = [
+    "[role='main']",
+    "main",
+    "#main-content",
+    "#content",
+    "#chapterContent",        # Cisco docs
+    "#fw-content",            # Cisco docs alt
+    "#pageContentDiv",        # Cisco docs alt
+    "#mw-content-text",       # Wikipedia
+    ".doc-content",
+    ".documentation-content",
+    ".article-content",
+    ".post-content",
+    ".entry-content",
+    ".td-content",
+    "article",                # last — often matches a single subsection, not the full page
+]
+
+ERROR_SIGNALS = [
+    "access denied",
+    "403 forbidden",
+    "404 not found",
+    "page not found",
+    "this page isn't available",
+    "you don't have permission",
+    "sign in to continue",
+    "log in to your account",
+    "please enable javascript",
+]
 
 
 # -- Search ------------------------------------------------------------------
@@ -92,39 +123,95 @@ def fetch_simple(url, session):
         return None
 
 
-def fetch_playwright(url):
+def fetch_playwright(url, browser=None):
     try:
         from playwright.sync_api import sync_playwright
-        from playwright_stealth import stealth_sync
+        from playwright_stealth import Stealth
     except ImportError:
         print("  Playwright not installed, skipping browser fallback", file=sys.stderr)
         return None
 
-    print(f"  Falling back to Playwright for {url}")
+    print(f"  Browser fetch for {url}")
+
+    def _fetch(browser_instance):
+        context = browser_instance.new_context(
+            user_agent=random.choice(USER_AGENTS),
+            viewport={"width": 1920, "height": 1080},
+        )
+        page = context.new_page()
+        Stealth().apply_stealth_sync(page)
+        page.goto(url, wait_until="networkidle", timeout=30000)
+        _dismiss_cookie_consent(page)
+        _scroll_to_bottom(page)
+        page.wait_for_timeout(2000)
+        html = page.content()
+        context.close()
+        return html
+
     try:
+        if browser:
+            return _fetch(browser)
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent=random.choice(USER_AGENTS),
-                viewport={"width": 1920, "height": 1080},
-            )
-            page = context.new_page()
-            stealth_sync(page)
-            page.goto(url, wait_until="networkidle", timeout=15000)
-            page.wait_for_timeout(3000)
-            html = page.content()
-            browser.close()
+            b = p.chromium.launch(headless=True)
+            html = _fetch(b)
+            b.close()
             return html
     except Exception as e:
         print(f"  Playwright fetch failed for {url}: {e}", file=sys.stderr)
         return None
 
 
-def fetch_page(url, session, delay=1.5):
+def _dismiss_cookie_consent(page):
+    """Click common cookie consent buttons to reveal content behind modals."""
+    consent_selectors = [
+        "button:has-text('Accept')",
+        "button:has-text('Accept All')",
+        "button:has-text('Accept Cookies')",
+        "button:has-text('I Agree')",
+        "button:has-text('OK')",
+        "#onetrust-accept-btn-handler",
+        ".cookie-consent-accept",
+        "[data-testid='cookie-accept']",
+    ]
+    for sel in consent_selectors:
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=500):
+                btn.click()
+                page.wait_for_timeout(500)
+                return
+        except Exception:
+            continue
+
+
+def _scroll_to_bottom(page):
+    """Scroll to trigger lazy-loaded content."""
+    try:
+        page.evaluate("""
+            async () => {
+                const delay = ms => new Promise(r => setTimeout(r, ms));
+                const height = () => document.body.scrollHeight;
+                let prev = 0;
+                while (height() !== prev) {
+                    prev = height();
+                    window.scrollTo(0, height());
+                    await delay(800);
+                }
+            }
+        """)
+    except Exception:
+        pass
+
+
+def fetch_page(url, session, delay=1.5, browser=None):
+    if url.lower().endswith(".pdf"):
+        print(f"  Skipping PDF: {url}", file=sys.stderr)
+        return None
+
     html = fetch_simple(url, session)
     text = trafilatura.extract(html) if html else None
     if not text or len(text.strip()) < PLAYWRIGHT_MIN_CONTENT_LEN:
-        html_pw = fetch_playwright(url)
+        html_pw = fetch_playwright(url, browser=browser)
         if html_pw:
             html = html_pw
     if delay > 0:
@@ -134,19 +221,99 @@ def fetch_page(url, session, delay=1.5):
 
 # -- Clean -------------------------------------------------------------------
 
-def clean_html(html, url):
-    if not html:
-        return None
-    text = trafilatura.extract(html, output_format="txt", include_links=True, include_tables=True)
-    if text and len(text.strip()) >= 100:
-        return text
+def _visible_text_len(html):
+    """Rough char count of all visible text in the HTML."""
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "noscript", "head"]):
+        tag.decompose()
+    return len(soup.get_text(separator=" ", strip=True))
+
+
+def _detect_error_page(html):
+    """Return a reason string if this looks like an error/login/block page."""
+    soup = BeautifulSoup(html, "lxml")
+    text = soup.get_text(separator=" ", strip=True).lower()[:2000]
+    if len(text) < 50:
+        return "empty page"
+    for signal in ERROR_SIGNALS:
+        if signal in text:
+            return signal
+    return None
+
+
+def _extract_main_container(html):
+    """Find the main content container and convert to markdown.
+
+    Picks the largest qualifying container to avoid grabbing a single
+    <article> subsection when a parent container holds the full page.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    best = None
+    best_len = 0
+    for sel in MAIN_CONTENT_SELECTORS:
+        for container in soup.select(sel):
+            text_len = len(container.get_text(strip=True))
+            if text_len > best_len:
+                best = container
+                best_len = text_len
+    if best and best_len > 200:
+        h = html2text.HTML2Text()
+        h.ignore_links = False
+        h.ignore_images = True
+        h.body_width = 0
+        return h.handle(str(best))
+    return None
+
+
+def _extract_full_page(html):
+    """Convert entire page to markdown, stripping nav/header/footer."""
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "noscript", "nav", "header", "footer"]):
+        tag.decompose()
+    for sel in ["[role='navigation']", "[role='banner']", "[role='contentinfo']",
+                ".sidebar", "#sidebar", ".nav", ".menu", ".breadcrumb",
+                ".cookie-banner", ".cookie-consent", "#onetrust-banner-sdk"]:
+        for el in soup.select(sel):
+            el.decompose()
     h = html2text.HTML2Text()
     h.ignore_links = False
     h.ignore_images = True
     h.body_width = 0
-    fallback = h.handle(html)
-    if fallback and len(fallback.strip()) >= 100:
-        return fallback
+    return h.handle(str(soup))
+
+
+def clean_html(html, url):
+    if not html:
+        return None
+
+    error = _detect_error_page(html)
+    if error:
+        print(f"  Detected error page ({error}), skipping", file=sys.stderr)
+        return None
+
+    visible_len = _visible_text_len(html)
+
+    # Tier 1: trafilatura — best for articles/blogs, fast and clean
+    text = trafilatura.extract(html, output_format="txt", include_links=True, include_tables=True)
+    if text and len(text.strip()) >= 100:
+        # Check if trafilatura captured most of the page content
+        ratio = len(text.strip()) / max(visible_len, 1)
+        if ratio > 0.15:
+            return text
+        print(f"  Trafilatura captured only {ratio:.0%} of page, trying container extraction", file=sys.stderr)
+
+    # Tier 2: targeted container — find <main>/<article>/etc and convert
+    container_text = _extract_main_container(html)
+    if container_text and len(container_text.strip()) >= 200:
+        return container_text
+
+    # Tier 3: full page with boilerplate stripped
+    full_text = _extract_full_page(html)
+    if full_text and len(full_text.strip()) >= 100:
+        return full_text
+
     return None
 
 

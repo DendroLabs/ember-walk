@@ -13,14 +13,33 @@ Search --> Fetch --> Clean --> Output
 ```
 
 1. **Search** -- DuckDuckGo (default) or Brave Search API
-2. **Fetch** -- Simple HTTP with realistic headers; auto-falls back to Playwright for JS-heavy pages
-3. **Clean** -- Trafilatura extracts main content, strips nav/ads/footers
+2. **Fetch** -- Simple HTTP with realistic headers; auto-falls back to Playwright for JS-heavy or bot-protected pages
+3. **Clean** -- 3-tier extraction pipeline (see below)
 4. **Output** -- One markdown file per page + an index, ready for LLM consumption
+
+### Content Extraction (3-tier)
+
+Not all pages are created equal. Blog posts, technical docs, and SPAs all need different extraction strategies. Emberwalk tries them in order and picks the best result:
+
+- **Tier 1: Trafilatura** -- Fast, clean, great for articles and blog posts. If it captures >15% of the page's visible text, we're done.
+- **Tier 2: Container extraction** -- Finds the main content container (`<main>`, `[role="main"]`, `#content`, etc.) and converts it to markdown. Handles long technical docs where Trafilatura truncates.
+- **Tier 3: Full page** -- Strips nav/header/footer/sidebar elements and converts the rest. Last resort, but never loses content.
+
+Error pages (403, 404, login walls) are detected and skipped rather than saved as garbage. Cookie consent modals are auto-dismissed. Lazy-loaded content is triggered by scrolling before extraction.
 
 ## Install
 
 ```bash
-cd ~/Documents/emberwalk
+git clone https://github.com/DendroLabs/ember-walk.git
+cd ember-walk
+./install.sh
+```
+
+The installer creates a virtual environment, installs all Python dependencies, and downloads the Chromium browser for Playwright. It prints the exact paths to use for CLI and MCP configuration when it finishes.
+
+Manual install if you prefer:
+
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -114,8 +133,9 @@ Firecrawl is built for scale. Emberwalk is built for "I need to research somethi
 
 - `ddgs` -- DuckDuckGo search
 - `requests` -- HTTP fetching
-- `trafilatura` -- content extraction
-- `html2text` -- fallback content cleaner
+- `trafilatura` -- content extraction (Tier 1)
+- `beautifulsoup4` + `lxml` -- DOM parsing and container extraction (Tier 2/3)
+- `html2text` -- HTML to markdown conversion
 - `playwright` + `playwright-stealth` -- JS rendering (lazy-loaded, only when needed)
 - `mcp` -- MCP server mode
 
