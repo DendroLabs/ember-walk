@@ -399,17 +399,134 @@ def run_cli(args):
 
 # -- MCP Server --------------------------------------------------------------
 
+def _write_fetch_output(urls_and_titles, contents, output_dir):
+    """Write fetched pages to disk and return index content."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    index_lines = [
+        f"# Fetched Pages",
+        f"Date: {now}",
+        f"Results: {len([c for c in contents if c])}/{len(urls_and_titles)} pages fetched successfully",
+        "",
+        "---",
+        "",
+    ]
+
+    file_count = 0
+    for (url, title), content in zip(urls_and_titles, contents):
+        if not content:
+            index_lines.append(f"- **{title or url}** — FAILED TO FETCH")
+            index_lines.append(f"  {url}")
+            index_lines.append("")
+            continue
+
+        file_count += 1
+        title_slug = slugify(title or url, max_len=40)
+        filename = f"{file_count:02d}_{title_slug}.md"
+
+        page_md = "\n".join([
+            f"# {title or url}",
+            f"URL: {url}",
+            f"Fetched: {now}",
+            "",
+            "---",
+            "",
+            content,
+        ])
+        (output_dir / filename).write_text(page_md, encoding="utf-8")
+
+        index_lines.append(f"- **[{title or url}]({filename})**")
+        index_lines.append(f"  {url}")
+        index_lines.append("")
+
+    index_path = output_dir / "index.md"
+    index_path.write_text("\n".join(index_lines), encoding="utf-8")
+    return str(index_path)
+
+
 def run_mcp_server():
+    import json as _json
     from mcp.server.fastmcp import FastMCP
 
     mcp = FastMCP(
         "emberwalk",
-        instructions="Emberwalk — lightweight web research. Searches the web, fetches pages, extracts clean markdown.",
+        instructions=(
+            "Emberwalk — lightweight web research.\n\n"
+            "Recommended workflow:\n"
+            "1. Call ew_search to get a list of candidate URLs + snippets (fast, no fetching)\n"
+            "2. Review the snippets and pick the most relevant URLs\n"
+            "3. Call ew_fetch with those URLs to get clean markdown files\n\n"
+            "This two-step approach lets you skip irrelevant pages instead of fetching everything blind."
+        ),
     )
 
     @mcp.tool()
-    def emberwalk(query: str, max_results: int = 10, use_brave: bool = False, output_dir: str = "") -> str:
-        """Search the web for a query, fetch and clean the top results, and save as markdown files.
+    def ew_search(query: str, max_results: int = 20, use_brave: bool = False) -> str:
+        """Search the web and return a list of candidate URLs with titles and snippets.
+
+        This is fast (no page fetching). Review the results and pass the best
+        URLs to ew_fetch to collect the actual page content.
+
+        Args:
+            query: The search query
+            max_results: Number of results to return (default 20, max 50)
+            use_brave: Use Brave Search instead of DuckDuckGo (requires BRAVE_API_KEY env var)
+
+        Returns:
+            JSON list of {url, title, snippet} objects
+        """
+        results = search(query, max_results=min(max_results, 50), use_brave=use_brave)
+        if not results:
+            return "No search results found."
+        return _json.dumps(results, indent=2)
+
+    @mcp.tool()
+    def ew_fetch(urls: list[str], output_dir: str = "") -> str:
+        """Fetch specific URLs, extract clean markdown, and save to disk.
+
+        Call this after ew_search to fetch only the pages you actually want.
+        Also works with URLs from any source (not just search results).
+
+        Args:
+            urls: List of URLs to fetch
+            output_dir: Where to save output (default: research_output/fetch-{timestamp}/)
+
+        Returns:
+            The content of the generated index.md file listing all fetched pages
+        """
+        if not urls:
+            return "No URLs provided."
+
+        session = make_session()
+        urls_and_titles = []
+        contents = []
+        for i, url in enumerate(urls):
+            print(f"[{i+1}/{len(urls)}] Fetching: {url[:80]}")
+            html = fetch_page(url, session, delay=1.5)
+            content = clean_html(html, url)
+            title = ""
+            if html:
+                soup = BeautifulSoup(html, "lxml")
+                title_tag = soup.find("title")
+                if title_tag:
+                    title = title_tag.get_text(strip=True)
+            urls_and_titles.append((url, title))
+            contents.append(content)
+
+        if not output_dir:
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            output_dir = str(Path("research_output") / f"fetch-{ts}")
+
+        index_path = _write_fetch_output(urls_and_titles, contents, output_dir)
+        return Path(index_path).read_text(encoding="utf-8")
+
+    @mcp.tool()
+    def ew_research(query: str, max_results: int = 10, use_brave: bool = False, output_dir: str = "") -> str:
+        """Search and fetch in one step. Convenience tool when you want all top results.
+
+        For more control, use ew_search + ew_fetch instead.
 
         Args:
             query: The search query
