@@ -10,6 +10,12 @@ import random
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from sanitizer import sanitize as _sanitize
+except ImportError:
+    _sanitize = None
+
 import requests
 import trafilatura
 import html2text
@@ -518,10 +524,34 @@ def clean_html(html, url):
             warning = f"possible truncation ({output_headings}/{heading_count} headings preserved, tier={tier_used})"
             print(f"  WARNING: {warning}", file=sys.stderr)
 
+    if _sanitize:
+        chosen, findings = _sanitize(chosen)
+        if findings:
+            chosen = "[Emberwalk: potential prompt injection content was found and removed from this page]\n\n" + chosen
+
     return chosen, warning
 
 
 # -- Output ------------------------------------------------------------------
+
+def _storage_note():
+    """Return a one-line storage summary for research_output/."""
+    root = Path("research_output")
+    if not root.exists():
+        return None
+    total = sum(f.stat().st_size for f in root.rglob("*") if f.is_file())
+    if total >= 1_000_000_000:
+        size_str = f"{total / 1_000_000_000:.1f} GB"
+    elif total >= 1_000_000:
+        size_str = f"{total / 1_000_000:.1f} MB"
+    else:
+        size_str = f"{total / 1_000:.1f} KB"
+    try:
+        display = "~/" + str(root.resolve().relative_to(Path.home()))
+    except ValueError:
+        display = str(root.resolve())
+    return f"> Storage: {display} is {size_str}"
+
 
 def slugify(text, max_len=60):
     slug = re.sub(r'[^\w\s-]', '', text.lower())
@@ -578,6 +608,9 @@ def write_output(query, results, contents, output_dir):
     index_path.write_text("\n".join(index_lines), encoding="utf-8")
     print(f"\nOutput written to {output_dir}/")
     print(f"  {file_count} page files + index.md")
+    note = _storage_note()
+    if note:
+        print(note)
     return str(index_path)
 
 
@@ -653,6 +686,10 @@ def _write_fetch_output(urls_and_titles, contents, output_dir):
         index_lines.append(f"- **[{title or url}]({filename})**{warn_flag}")
         index_lines.append(f"  {url}")
         index_lines.append("")
+
+    note = _storage_note()
+    if note:
+        index_lines += ["", note]
 
     index_path = output_dir / "index.md"
     index_path.write_text("\n".join(index_lines), encoding="utf-8")
