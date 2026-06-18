@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 research_output/
 benchmark_output/
+continue.txt
+CLAUDE.md
+.DS_Store
+tasks/

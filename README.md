@@ -101,6 +101,24 @@ Each page file includes:
 - Title, source URL, fetch timestamp
 - Clean extracted content (no HTML, no boilerplate)
 
+## Prompt Injection Protection
+
+All fetched content passes through `sanitizer.py` before being returned to the LLM. It scans for and redacts:
+
+- **Instruction overrides** -- "ignore all previous instructions", "your new task is..." (CRITICAL)
+- **Role hijacking** -- "you are now...", "act as...", DAN mode, developer mode (CRITICAL)
+- **Model control tokens** -- `<|im_start|>`, `[INST]`, `<<SYS>>` and similar delimiters (CRITICAL)
+- **System prompt extraction** -- "reveal your system prompt", "repeat everything above" (CRITICAL)
+- **Indirect injection** -- labelled directives like `[Note to Claude:]`, `ASSISTANT:` (HIGH)
+- **Data exfiltration** -- malicious image links, `fetch()`, `sendBeacon()` calls (HIGH)
+- **Invisible Unicode** -- zero-width spaces, RTL overrides, tag block characters (MEDIUM)
+- **Homoglyphs** -- Cyrillic/Greek characters visually identical to Latin (MEDIUM)
+- **Base64 payloads** -- long base64 blobs that decode to injection content (HIGH)
+
+Matches are redacted inline with `[REDACTED: category/severity]` and a plain-English warning is prepended to the page content. Search snippets (`ew_search`) are not sanitized -- they are low-risk and short.
+
+No LLM or external service involved -- pure stdlib regex, runs in-process.
+
 ## Anti-Bot Defaults
 
 Built in, no configuration needed:
