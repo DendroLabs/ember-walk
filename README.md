@@ -157,6 +157,10 @@ Firecrawl is built for scale. Emberwalk is built for "I need to research somethi
 - `playwright` + `playwright-stealth` -- JS rendering (lazy-loaded, only when needed)
 - `mcp` -- MCP server mode
 
+## Disclaimer
+
+Emberwalk's sanitizer is designed to catch the passive prompt injection threats that come with web scraping -- the injected payloads embedded in web pages, SEO spam, and user-generated content that try to hijack any LLM that happens to ingest them. It is **not a guarantee** against targeted or novel attacks, and sophisticated payloads may evade pattern-based detection. Emberwalk should be used as one layer alongside other security practices, not as your only line of defense. Use at your own risk.
+
 ## License
 
 MIT
