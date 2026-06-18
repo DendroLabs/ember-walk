@@ -250,6 +250,65 @@ def _detect_error_page(html):
     return None
 
 
+def _normalize_tables(soup):
+    """Flatten nested layout tables and normalize cell whitespace.
+
+    Many documentation sites (e.g. Cisco) wrap content tables inside layout
+    tables, producing deeply nested structures that html2text renders with
+    runaway leading whitespace. This flattens pure-layout wrappers and
+    collapses whitespace inside cells so the converter produces clean
+    markdown tables.
+    """
+    # Flatten nested layout tables: if a <td> contains exactly one <table>
+    # (and nothing else significant), replace the outer table with the inner
+    for table in list(soup.find_all("table")):
+        cells = table.find_all("td", recursive=False) or table.find_all("th", recursive=False)
+        if not cells:
+            rows = table.find_all("tr", recursive=False)
+            if rows:
+                cells = []
+                for row in rows:
+                    cells.extend(row.find_all(["td", "th"], recursive=False))
+        if len(cells) == 1:
+            inner_tables = cells[0].find_all("table", recursive=False)
+            non_table_text = cells[0].get_text(strip=True)
+            inner_text = "".join(t.get_text(strip=True) for t in inner_tables)
+            if inner_tables and len(inner_tables) == 1 and non_table_text == inner_text:
+                table.replace_with(inner_tables[0])
+
+    # Normalize whitespace inside all td/th cells
+    for cell in soup.find_all(["td", "th"]):
+        # Collapse internal whitespace to single spaces
+        for text_node in cell.find_all(string=True):
+            cleaned = re.sub(r'\s+', ' ', text_node.string or '').strip()
+            text_node.replace_with(cleaned)
+
+    return soup
+
+
+def _soup_to_markdown(soup):
+    """Convert a BeautifulSoup tree to markdown with table normalization."""
+    _normalize_tables(soup)
+    h = html2text.HTML2Text()
+    h.ignore_links = False
+    h.ignore_images = True
+    h.body_width = 0
+    md = h.handle(str(soup))
+    # Post-process: left-trim whitespace inside markdown table cells
+    lines = []
+    for line in md.split('\n'):
+        if '|' in line and line.strip().startswith('|'):
+            cells = line.split('|')
+            cells = [c.strip() for c in cells]
+            line = ' | '.join(cells).strip()
+            if not line.startswith('|'):
+                line = '| ' + line
+            if not line.endswith('|'):
+                line = line + ' |'
+        lines.append(line)
+    return '\n'.join(lines)
+
+
 def _extract_main_container(html):
     """Find the main content container and convert to markdown.
 
@@ -268,11 +327,7 @@ def _extract_main_container(html):
                 best = container
                 best_len = text_len
     if best and best_len > 200:
-        h = html2text.HTML2Text()
-        h.ignore_links = False
-        h.ignore_images = True
-        h.body_width = 0
-        return h.handle(str(best))
+        return _soup_to_markdown(best)
     return None
 
 
@@ -286,11 +341,7 @@ def _extract_full_page(html):
                 ".cookie-banner", ".cookie-consent", "#onetrust-banner-sdk"]:
         for el in soup.select(sel):
             el.decompose()
-    h = html2text.HTML2Text()
-    h.ignore_links = False
-    h.ignore_images = True
-    h.body_width = 0
-    return h.handle(str(soup))
+    return _soup_to_markdown(soup)
 
 
 def _count_headings(html):
