@@ -4,6 +4,28 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/.venv"
 
+# Update mode: pull latest from git before installing
+if [ "${1:-}" = "--update" ] || [ "${1:-}" = "-u" ]; then
+    echo "=== Emberwalk Update ==="
+    echo ""
+    cd "$SCRIPT_DIR"
+    if [ -d ".git" ]; then
+        BEFORE=$(git rev-parse HEAD)
+        git pull --ff-only
+        AFTER=$(git rev-parse HEAD)
+        if [ "$BEFORE" = "$AFTER" ]; then
+            echo "Already up to date."
+            exit 0
+        fi
+        echo ""
+        git log --oneline "$BEFORE".."$AFTER"
+        echo ""
+    else
+        echo "ERROR: not a git repo — clone from GitHub first."
+        exit 1
+    fi
+fi
+
 echo "=== Emberwalk Installer ==="
 echo ""
 
