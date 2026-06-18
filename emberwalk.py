@@ -112,13 +112,29 @@ def make_session():
     return session
 
 
-def fetch_simple(url, session, retries=1):
-    session.headers["User-Agent"] = random.choice(USER_AGENTS)
+def fetch_simple(url, session, retries=3):
+    RETRYABLE_STATUS = {403, 429, 500, 502, 503}
     for attempt in range(1 + retries):
+        session.headers["User-Agent"] = random.choice(USER_AGENTS)
         try:
-            resp = session.get(url, timeout=15, allow_redirects=True)
+            resp = session.get(url, timeout=20, allow_redirects=True)
             resp.raise_for_status()
             return resp.text
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status in RETRYABLE_STATUS and attempt < retries:
+                retry_after = (e.response.headers.get("Retry-After")
+                               if e.response is not None else None)
+                if retry_after and str(retry_after).isdigit():
+                    wait = min(float(retry_after), 30.0)
+                else:
+                    wait = min(1.5 * (2 ** attempt), 20.0) + random.random()
+                print(f"  HTTP {status} on {url}, backing off {wait:.1f}s "
+                      f"(attempt {attempt + 1}/{retries + 1})", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            print(f"  Simple fetch failed for {url}: {e}", file=sys.stderr)
+            return None
         except (requests.ConnectionError, requests.Timeout) as e:
             if attempt < retries:
                 wait = 1.0 + random.random()
@@ -321,6 +337,71 @@ def _extract_admonitions_from_tables(soup):
             insert_point = adm
 
 
+def _normalize_gfm_tables(md):
+    """Rewrite html2text's loose pipe tables into valid GitHub-Flavored Markdown.
+
+    Anchors on separator lines and rewrites adjacent header/data rows with
+    proper leading/trailing pipes and column-matched separators. Only touches
+    lines adjacent to a separator — prose with inline | is left alone.
+    """
+    sep_re = re.compile(r'^\s*\|?\s*:?-{2,}:?(\s*\|\s*:?-{2,}:?)+\s*\|?\s*$')
+
+    def cells(row):
+        r = row.strip()
+        if r.startswith("|"):
+            r = r[1:]
+        if r.endswith("|"):
+            r = r[:-1]
+        return [c.strip() for c in r.split("|")]
+
+    def fmt(cell_list, ncol):
+        cl = list(cell_list)
+        if len(cl) < ncol:
+            cl += [""] * (ncol - len(cl))
+        elif len(cl) > ncol:
+            cl = cl[:ncol - 1] + [" ".join(cl[ncol - 1:])]
+        return "| " + " | ".join(cl) + " |"
+
+    lines = md.split("\n")
+    out = []
+    i, n = 0, len(lines)
+    while i < n:
+        if sep_re.match(lines[i]):
+            ncol = max(2, len(cells(lines[i])))
+            hidx = len(out) - 1
+            while hidx >= 0 and out[hidx].strip() == "":
+                hidx -= 1
+            header = out[hidx] if (hidx >= 0 and "|" in out[hidx]) else None
+            j = i + 1
+            rows = []
+            while j < n and lines[j].strip() != "" and "|" in lines[j]:
+                rows.append(lines[j])
+                j += 1
+            header_cells = cells(header) if header is not None else []
+            header_has_text = any(header_cells)
+            rows_have_text = any(any(c for c in cells(r)) for r in rows)
+            if not header_has_text and not rows_have_text:
+                if header is not None:
+                    del out[hidx]
+                i = j
+                continue
+            if header is not None:
+                out[hidx] = fmt(header_cells, ncol)
+            else:
+                out.append(fmt([""] * ncol, ncol))
+            out.append("| " + " | ".join(["---"] * ncol) + " |")
+            for r in rows:
+                rc = cells(r)
+                if not any(rc):
+                    continue
+                out.append(fmt(rc, ncol))
+            i = j
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
 def _soup_to_markdown(soup):
     """Convert a BeautifulSoup tree to markdown with pre-processing."""
     _ensure_inter_element_spaces(soup)
@@ -329,7 +410,7 @@ def _soup_to_markdown(soup):
     h.ignore_links = False
     h.ignore_images = True
     h.body_width = 0
-    return h.handle(str(soup))
+    return _normalize_gfm_tables(h.handle(str(soup)))
 
 
 def _extract_main_container(html):
