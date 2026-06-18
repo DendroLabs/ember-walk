@@ -250,63 +250,86 @@ def _detect_error_page(html):
     return None
 
 
-def _normalize_tables(soup):
-    """Flatten nested layout tables and normalize cell whitespace.
+def _ensure_inter_element_spaces(soup):
+    """Insert whitespace between adjacent inline elements that would merge.
 
-    Many documentation sites (e.g. Cisco) wrap content tables inside layout
-    tables, producing deeply nested structures that html2text renders with
-    runaway leading whitespace. This flattens pure-layout wrappers and
-    collapses whitespace inside cells so the converter produces clean
-    markdown tables.
+    html2text and get_text(strip=True) drop whitespace at element boundaries,
+    causing 'RoutersRouting' / 'ersModular' artifacts. This inserts a space
+    NavigableString between adjacent inline tags where none exists.
     """
-    # Flatten nested layout tables: if a <td> contains exactly one <table>
-    # (and nothing else significant), replace the outer table with the inner
+    from bs4 import NavigableString
+    inline_tags = {
+        "a", "abbr", "b", "bdi", "bdo", "cite", "code", "data", "dfn", "em",
+        "i", "kbd", "mark", "q", "rp", "rt", "ruby", "s", "samp", "small",
+        "span", "strong", "sub", "sup", "time", "u", "var", "wbr",
+    }
+    for tag in soup.find_all(True):
+        if tag.name not in inline_tags:
+            continue
+        nxt = tag.next_sibling
+        if nxt is None:
+            continue
+        if isinstance(nxt, NavigableString):
+            # If the text node between elements is empty/whitespace-only, ensure
+            # at least one space so words don't merge
+            if nxt.string is not None and nxt.string.strip() == '' and len(nxt.string) == 0:
+                nxt.replace_with(' ')
+        elif hasattr(nxt, 'name') and nxt.name in inline_tags:
+            tag.insert_after(NavigableString(' '))
+
+
+def _extract_admonitions_from_tables(soup):
+    """Move Note/Warning/Caution boxes out of table cells.
+
+    Cisco docs embed admonition divs inside <td> cells, which html2text
+    renders as extra columns in the same row — breaking the table's column
+    count. This extracts them and places them after the parent table.
+    """
+    admonition_selectors = [
+        "[class*='note']", "[class*='Note']",
+        "[class*='warning']", "[class*='Warning']",
+        "[class*='caution']", "[class*='Caution']",
+        "[class*='alert']",
+    ]
+    admonition_text_signals = ["note", "caution", "warning", "tip"]
+
     for table in list(soup.find_all("table")):
-        cells = table.find_all("td", recursive=False) or table.find_all("th", recursive=False)
-        if not cells:
-            rows = table.find_all("tr", recursive=False)
-            if rows:
-                cells = []
-                for row in rows:
-                    cells.extend(row.find_all(["td", "th"], recursive=False))
-        if len(cells) == 1:
-            inner_tables = cells[0].find_all("table", recursive=False)
-            non_table_text = cells[0].get_text(strip=True)
-            inner_text = "".join(t.get_text(strip=True) for t in inner_tables)
-            if inner_tables and len(inner_tables) == 1 and non_table_text == inner_text:
-                table.replace_with(inner_tables[0])
-
-    # Normalize whitespace inside all td/th cells
-    for cell in soup.find_all(["td", "th"]):
-        # Collapse internal whitespace to single spaces
-        for text_node in cell.find_all(string=True):
-            cleaned = re.sub(r'\s+', ' ', text_node.string or '').strip()
-            text_node.replace_with(cleaned)
-
-    return soup
+        extracted = []
+        for cell in table.find_all(["td", "th"]):
+            # Find admonitions by class
+            for sel in admonition_selectors:
+                for adm in cell.select(sel):
+                    extracted.append(adm.extract())
+            # Find bold Note/Warning/Caution markers that start a block
+            for bold in cell.find_all(["b", "strong"]):
+                text = (bold.get_text(strip=True) or "").lower().rstrip(":")
+                if text in admonition_text_signals:
+                    # Extract the bold tag and all following siblings in this cell
+                    adm_parts = [bold.extract()]
+                    while bold.next_sibling:
+                        adm_parts.append(bold.next_sibling.extract())
+                    wrapper = soup.new_tag("div")
+                    wrapper["class"] = ["extracted-admonition"]
+                    for part in adm_parts:
+                        wrapper.append(part)
+                    extracted.append(wrapper)
+                    break
+        # Place extracted admonitions after the table
+        insert_point = table
+        for adm in extracted:
+            insert_point.insert_after(adm)
+            insert_point = adm
 
 
 def _soup_to_markdown(soup):
-    """Convert a BeautifulSoup tree to markdown with table normalization."""
-    _normalize_tables(soup)
+    """Convert a BeautifulSoup tree to markdown with pre-processing."""
+    _ensure_inter_element_spaces(soup)
+    _extract_admonitions_from_tables(soup)
     h = html2text.HTML2Text()
     h.ignore_links = False
     h.ignore_images = True
     h.body_width = 0
-    md = h.handle(str(soup))
-    # Post-process: left-trim whitespace inside markdown table cells
-    lines = []
-    for line in md.split('\n'):
-        if '|' in line and line.strip().startswith('|'):
-            cells = line.split('|')
-            cells = [c.strip() for c in cells]
-            line = ' | '.join(cells).strip()
-            if not line.startswith('|'):
-                line = '| ' + line
-            if not line.endswith('|'):
-                line = line + ' |'
-        lines.append(line)
-    return '\n'.join(lines)
+    return h.handle(str(soup))
 
 
 def _extract_main_container(html):
