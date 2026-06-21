@@ -58,7 +58,7 @@ echo "Installing Playwright Chromium browser..."
 echo ""
 echo "Verifying installation..."
 "$VENV_DIR/bin/python3" -c "
-import ddgs, requests, trafilatura, html2text, bs4, mcp
+import ddgs, requests, trafilatura, html2text, bs4, mcp, pypdf
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
 print('  All imports OK')

@@ -13,7 +13,7 @@ Search --> Fetch --> Clean --> Output
 ```
 
 1. **Search** -- DuckDuckGo (default) or Brave Search API
-2. **Fetch** -- Simple HTTP with realistic headers; auto-falls back to Playwright for JS-heavy or bot-protected pages
+2. **Fetch** -- Simple HTTP with realistic headers; auto-falls back to Playwright for JS-heavy or bot-protected pages. PDFs (`.pdf` URLs) are downloaded and text-extracted via `pypdf`
 3. **Clean** -- 3-tier extraction pipeline (see below)
 4. **Output** -- One markdown file per page + an index, ready for LLM consumption
 
@@ -155,6 +155,7 @@ Firecrawl is built for scale. Emberwalk is built for "I need to research somethi
 - `beautifulsoup4` + `lxml` -- DOM parsing and container extraction (Tier 2/3)
 - `html2text` -- HTML to markdown conversion
 - `playwright` + `playwright-stealth` -- JS rendering (lazy-loaded, only when needed)
+- `pypdf` -- PDF text extraction (lazy-loaded; PDFs are skipped gracefully if absent)
 - `mcp` -- MCP server mode
 
 ## Disclaimer

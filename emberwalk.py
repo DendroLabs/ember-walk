@@ -118,14 +118,20 @@ def make_session():
     return session
 
 
-def fetch_simple(url, session, retries=3):
+def _request_with_retry(url, session, retries=3):
+    """GET a URL with retry/backoff on transient HTTP + connection errors.
+
+    Returns the requests.Response on success, or None on failure. Rotates the
+    User-Agent per attempt to dodge per-UA/per-burst throttling. Shared by
+    fetch_simple (HTML, uses .text) and fetch_pdf (uses .content).
+    """
     RETRYABLE_STATUS = {403, 429, 500, 502, 503}
     for attempt in range(1 + retries):
         session.headers["User-Agent"] = random.choice(USER_AGENTS)
         try:
             resp = session.get(url, timeout=20, allow_redirects=True)
             resp.raise_for_status()
-            return resp.text
+            return resp
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else None
             if status in RETRYABLE_STATUS and attempt < retries:
@@ -152,6 +158,11 @@ def fetch_simple(url, session, retries=3):
         except requests.RequestException as e:
             print(f"  Simple fetch failed for {url}: {e}", file=sys.stderr)
             return None
+
+
+def fetch_simple(url, session, retries=3):
+    resp = _request_with_retry(url, session, retries=retries)
+    return resp.text if resp is not None else None
 
 
 def fetch_playwright(url, browser=None):
@@ -235,10 +246,6 @@ def _scroll_to_bottom(page):
 
 
 def fetch_page(url, session, delay=1.5, browser=None):
-    if url.lower().endswith(".pdf"):
-        print(f"  Skipping PDF: {url}", file=sys.stderr)
-        return None
-
     html = fetch_simple(url, session)
     text = trafilatura.extract(html) if html else None
     if not text or len(text.strip()) < PLAYWRIGHT_MIN_CONTENT_LEN:
@@ -248,6 +255,74 @@ def fetch_page(url, session, delay=1.5, browser=None):
     if delay > 0:
         time.sleep(delay)
     return html
+
+
+def _looks_like_pdf(url):
+    """True if the URL path (ignoring query/fragment) ends in .pdf."""
+    path = url.lower().split("?", 1)[0].split("#", 1)[0]
+    return path.endswith(".pdf")
+
+
+def fetch_pdf(url, session, delay=1.5):
+    """Download a PDF and extract its text. Returns (content, warning).
+
+    pypdf is an optional dependency — if it's missing, the PDF is skipped with
+    a clear message (same pattern as the optional Playwright fallback). Reuses
+    _request_with_retry so PDFs get the same 403/backoff/UA-rotation handling.
+    """
+    try:
+        import pypdf
+    except ImportError:
+        print(f"  Skipping PDF (pypdf not installed): {url}", file=sys.stderr)
+        print("  Install with: pip install pypdf", file=sys.stderr)
+        return None, None
+
+    print(f"  PDF fetch for {url}")
+    resp = _request_with_retry(url, session)
+    if resp is None:
+        return None, None
+    data = resp.content
+    if not data.startswith(b"%PDF"):
+        print(f"  Not a valid PDF (no %PDF header): {url}", file=sys.stderr)
+        return None, None
+
+    import io
+    parts = None
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(data))
+        if reader.is_encrypted:
+            try:
+                reader.decrypt("")
+            except Exception:
+                pass
+        parts = [(page.extract_text() or "") for page in reader.pages]
+    except Exception as e:
+        print(f"  PDF parse failed for {url}: {e}", file=sys.stderr)
+    if delay > 0:
+        time.sleep(delay)
+    if parts is None:
+        return None, None
+
+    text = "\n\n".join(p.strip() for p in parts if p.strip())
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    warning = None
+    if len(text) < 100:
+        warning = (f"possible PDF extraction failure ({len(text)} chars from "
+                   f"{len(parts)} pages — may be scanned/image-only)")
+        print(f"  WARNING: {warning}", file=sys.stderr)
+        if not text:
+            return None, warning
+
+    return _apply_sanitizer(text), warning
+
+
+def fetch_and_extract(url, session, delay=1.5, browser=None):
+    """Fetch a URL and return (content, warning). Routes PDFs to fetch_pdf."""
+    if _looks_like_pdf(url):
+        return fetch_pdf(url, session, delay=delay)
+    html = fetch_page(url, session, delay=delay, browser=browser)
+    return clean_html(html, url)
 
 
 # -- Clean -------------------------------------------------------------------
@@ -460,6 +535,20 @@ def _count_headings(html):
     return len(soup.find_all(["h2", "h3"]))
 
 
+def _apply_sanitizer(text):
+    """Run the prompt-injection sanitizer; prepend a warning header if it fired.
+
+    Shared by clean_html (HTML pipeline) and fetch_pdf (PDF pipeline).
+    """
+    if not _sanitize or not text:
+        return text
+    cleaned, findings = _sanitize(text)
+    if findings:
+        return ("[Emberwalk: potential prompt injection content was found and "
+                "removed from this page]\n\n" + cleaned)
+    return cleaned
+
+
 def clean_html(html, url):
     if not html:
         return None, None
@@ -524,12 +613,7 @@ def clean_html(html, url):
             warning = f"possible truncation ({output_headings}/{heading_count} headings preserved, tier={tier_used})"
             print(f"  WARNING: {warning}", file=sys.stderr)
 
-    if _sanitize:
-        chosen, findings = _sanitize(chosen)
-        if findings:
-            chosen = "[Emberwalk: potential prompt injection content was found and removed from this page]\n\n" + chosen
-
-    return chosen, warning
+    return _apply_sanitizer(chosen), warning
 
 
 # -- Output ------------------------------------------------------------------
@@ -551,6 +635,12 @@ def _storage_note():
     except ValueError:
         display = str(root.resolve())
     return f"> Storage: {display} is {size_str}"
+
+
+def _pdf_title(url):
+    """Derive a human title for a PDF from its URL filename."""
+    name = url.split("?", 1)[0].rstrip("/").split("/")[-1]
+    return name or url
 
 
 def slugify(text, max_len=60):
@@ -626,8 +716,7 @@ def run_cli(args):
     contents = []
     for i, r in enumerate(results):
         print(f"[{i+1}/{len(results)}] Fetching: {r['title'][:60]}")
-        html = fetch_page(r["url"], session, delay=args.delay)
-        content, warning = clean_html(html, r["url"])
+        content, warning = fetch_and_extract(r["url"], session, delay=args.delay)
         contents.append((content, warning))
         if content:
             warn_msg = f" [WARNING: {warning}]" if warning else ""
@@ -754,14 +843,18 @@ def run_mcp_server():
         contents = []
         for i, url in enumerate(urls):
             print(f"[{i+1}/{len(urls)}] Fetching: {url[:80]}")
-            html = fetch_page(url, session, delay=1.5)
-            content, warning = clean_html(html, url)
-            title = ""
-            if html:
-                soup = BeautifulSoup(html, "lxml")
-                title_tag = soup.find("title")
-                if title_tag:
-                    title = title_tag.get_text(strip=True)
+            if _looks_like_pdf(url):
+                content, warning = fetch_pdf(url, session, delay=1.5)
+                title = _pdf_title(url)
+            else:
+                html = fetch_page(url, session, delay=1.5)
+                content, warning = clean_html(html, url)
+                title = ""
+                if html:
+                    soup = BeautifulSoup(html, "lxml")
+                    title_tag = soup.find("title")
+                    if title_tag:
+                        title = title_tag.get_text(strip=True)
             urls_and_titles.append((url, title))
             contents.append((content, warning))
 
@@ -794,8 +887,7 @@ def run_mcp_server():
         session = make_session()
         contents = []
         for i, r in enumerate(results):
-            html = fetch_page(r["url"], session, delay=1.5)
-            content, warning = clean_html(html, r["url"])
+            content, warning = fetch_and_extract(r["url"], session, delay=1.5)
             contents.append((content, warning))
 
         if not output_dir:
