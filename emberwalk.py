@@ -4,6 +4,7 @@
 import argparse
 import os
 import re
+import socket
 import sys
 import time
 import random
@@ -108,6 +109,48 @@ def search(query, max_results=10, use_brave=False):
     results = fn(query, max_results)
     print(f"Found {len(results)} results")
     return results
+
+
+# -- Diagnostics -------------------------------------------------------------
+
+def _check_connectivity(timeout=3.0):
+    """Return True if the machine has any internet connectivity.
+
+    Raw TCP connect to well-known hosts (Cloudflare / Google DNS) so we can
+    tell 'this whole machine is offline' apart from 'emberwalk's search or
+    fetch failed'. Only called on the failure path, so the latency is fine.
+    """
+    for host, port in (("1.1.1.1", 443), ("8.8.8.8", 53)):
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _diagnose_failure(operation, reason):
+    """Build a user-facing diagnostic for an emberwalk failure.
+
+    Distinguishes a machine-wide outage from an emberwalk-side problem so the
+    user knows whether the issue is their network or the tool itself.
+    """
+    if not _check_connectivity():
+        return (
+            f"Emberwalk: {operation} failed, and a direct connectivity check "
+            f"also failed -- this machine appears to be offline. Check your "
+            f"Wi-Fi / VPN / network connection. (underlying error: {reason})"
+        )
+    return (
+        f"Emberwalk: {operation} failed, but the network is reachable -- this "
+        f"is an emberwalk-side problem, not your connection. "
+        f"Underlying error: {reason}"
+    )
+
+
+def _all_fetches_failed(contents):
+    """True when at least one page was attempted and every one came back empty."""
+    return bool(contents) and all(not c for c, _ in contents)
 
 
 # -- Fetch -------------------------------------------------------------------
@@ -707,7 +750,11 @@ def write_output(query, results, contents, output_dir):
 # -- CLI ---------------------------------------------------------------------
 
 def run_cli(args):
-    results = search(args.query, max_results=args.results, use_brave=args.brave)
+    try:
+        results = search(args.query, max_results=args.results, use_brave=args.brave)
+    except Exception as e:
+        print(_diagnose_failure("search", repr(e)), file=sys.stderr)
+        sys.exit(1)
     if not results:
         print("No search results found.", file=sys.stderr)
         sys.exit(1)
@@ -723,6 +770,10 @@ def run_cli(args):
             print(f"  OK ({len(content)} chars){warn_msg}")
         else:
             print("  FAILED — no usable content")
+
+    if _all_fetches_failed(contents):
+        print(_diagnose_failure(f"all {len(contents)} fetches",
+                                "every page returned empty"), file=sys.stderr)
 
     output_dir = args.output or str(Path("research_output") / slugify(args.query))
     write_output(args.query, results, contents, output_dir)
@@ -816,13 +867,16 @@ def run_mcp_server():
         Returns:
             JSON list of {url, title, snippet} objects
         """
-        results = search(query, max_results=min(max_results, 50), use_brave=use_brave)
+        try:
+            results = search(query, max_results=min(max_results, 50), use_brave=use_brave)
+        except Exception as e:
+            return _diagnose_failure("search", repr(e))
         if not results:
             return "No search results found."
         return _json.dumps(results, indent=2)
 
     @mcp.tool()
-    def ew_fetch(urls: list[str], output_dir: str = "") -> str:
+    def ew_fetch(urls: list[str], output_dir: str = "", subject: str = "") -> str:
         """Fetch specific URLs, extract clean markdown, and save to disk.
 
         Call this after ew_search to fetch only the pages you actually want.
@@ -830,7 +884,9 @@ def run_mcp_server():
 
         Args:
             urls: List of URLs to fetch
-            output_dir: Where to save output (default: research_output/fetch-{timestamp}/)
+            output_dir: Where to save output (default: research_output/fetch-{subject}-{timestamp}/)
+            subject: Optional 1-2 word topic (e.g. "monitors") used to name the
+                default output folder so it's recognizable later. Omit for ad-hoc fetches.
 
         Returns:
             The content of the generated index.md file listing all fetched pages
@@ -860,10 +916,17 @@ def run_mcp_server():
 
         if not output_dir:
             ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-            output_dir = str(Path("research_output") / f"fetch-{ts}")
+            subject_slug = slugify(subject, max_len=30) if subject else ""
+            folder = f"fetch-{subject_slug}-{ts}" if subject_slug else f"fetch-{ts}"
+            output_dir = str(Path("research_output") / folder)
 
         index_path = _write_fetch_output(urls_and_titles, contents, output_dir)
-        return Path(index_path).read_text(encoding="utf-8")
+        index_text = Path(index_path).read_text(encoding="utf-8")
+        if _all_fetches_failed(contents):
+            diag = _diagnose_failure(f"all {len(contents)} fetches",
+                                     "every page returned empty")
+            index_text = f"{diag}\n\n---\n\n{index_text}"
+        return index_text
 
     @mcp.tool()
     def ew_research(query: str, max_results: int = 10, use_brave: bool = False, output_dir: str = "") -> str:
@@ -880,7 +943,10 @@ def run_mcp_server():
         Returns:
             The content of the generated index.md file
         """
-        results = search(query, max_results=max_results, use_brave=use_brave)
+        try:
+            results = search(query, max_results=max_results, use_brave=use_brave)
+        except Exception as e:
+            return _diagnose_failure("search", repr(e))
         if not results:
             return "No search results found."
 
@@ -894,7 +960,12 @@ def run_mcp_server():
             output_dir = str(Path("research_output") / slugify(query))
 
         index_path = write_output(query, results, contents, output_dir)
-        return Path(index_path).read_text(encoding="utf-8")
+        index_text = Path(index_path).read_text(encoding="utf-8")
+        if _all_fetches_failed(contents):
+            diag = _diagnose_failure(f"all {len(contents)} fetches",
+                                     "every page returned empty")
+            index_text = f"{diag}\n\n---\n\n{index_text}"
+        return index_text
 
     mcp.run(transport="stdio")
 
